@@ -1,231 +1,480 @@
-import re
+# app.py
+# Streamlit: VRChat log をドラッグ&ドロップ → type:requestInvite をパース
+# 指定時間で絞り込み → 抽選人数を指定して抽選
+# 参加者リスト / 当選者リスト / ブラックリスト（username, sender_user_id, reason）のインポート・エクスポート対応
+#
+# 実行: streamlit run app.py
+
+from __future__ import annotations
+
 import io
-import csv
-from dataclasses import dataclass
-from datetime import datetime, timezone, timedelta
+import re
 import random
+from dataclasses import dataclass
+from datetime import datetime
+from typing import Optional
 
 import pandas as pd
 import streamlit as st
 
-JST = timezone(timedelta(hours=9))
 
-# 例：
-# Received Notification: <Notification from username:楓さん。, sender user id:usr_... to ... of type: requestInvite, ... created at: 12/21/2025 15:40:13 UTC, ... type:requestInvite, ...>
-PATTERN = re.compile(
-    r"Received Notification:\s*<Notification\s+from\s+username:(?P<username>.*?),\s*"
-    r"sender user id:(?P<sender_user_id>usr_[0-9a-fA-F\-]+).*?"
-    r"created at:\s*(?P<created_at>\d{1,2}/\d{1,2}/\d{4}\s+\d{2}:\d{2}:\d{2})\s+UTC,.*?"
-    r"type:requestInvite",
-    re.DOTALL
+# =========================
+# Regex / Parsing
+# =========================
+TS_RE = re.compile(r"^(?P<ts>\d{4}\.\d{2}\.\d{2} \d{2}:\d{2}:\d{2})")
+
+# 想定ログ1行:
+NOTIF_RE = re.compile(
+    r"Received Notification:\s*<Notification\s+"
+    r"from username:(?P<username>.*?),\s*"
+    r"sender user id:\s*(?P<sender>usr_[0-9a-fA-F-]+)\s+"
+    r".*?\btype:\s*(?P<type>[A-Za-z0-9_]+)\b"
 )
 
-def parse_created_at_utc_to_jst(s: str) -> datetime:
-    # "12/21/2025 15:40:13" (UTC) -> JST datetime aware
-    dt_utc = datetime.strptime(s, "%m/%d/%Y %H:%M:%S").replace(tzinfo=timezone.utc)
-    return dt_utc.astimezone(JST)
 
-def parse_log_to_df(text: str) -> pd.DataFrame:
+def _parse_ts(ts_str: str) -> Optional[datetime]:
+    try:
+        return datetime.strptime(ts_str, "%Y.%m.%d %H:%M:%S")
+    except Exception:
+        return None
+
+
+def parse_request_invite_lines(lines: list[str]) -> pd.DataFrame:
+    """
+    - "Received Notification:" 行のみ対象
+    - type が requestInvite で完全一致のものだけ採用
+    """
     rows = []
-    for m in PATTERN.finditer(text):
+    for line in lines:
+        if "Received Notification:" not in line:
+            continue
+
+        m = NOTIF_RE.search(line)
+        if not m:
+            continue
+
+        typ = (m.group("type") or "").strip()
+        if typ != "requestInvite":
+            continue
+
+        ts_m = TS_RE.match(line)
+        ts_str = ts_m.group("ts") if ts_m else None
+        ts = _parse_ts(ts_str) if ts_str else None
+
         username = (m.group("username") or "").strip()
-        sender_user_id = (m.group("sender_user_id") or "").strip()
-        created_at_raw = (m.group("created_at") or "").strip()
-        created_at_jst = parse_created_at_utc_to_jst(created_at_raw)
+        if username == "":
+            username = None
+
         rows.append(
             {
-                "created_at_jst": created_at_jst,
+                "timestamp_str": ts_str,
+                "timestamp": ts,
                 "username": username,
-                "sender_user_id": sender_user_id,
+                "sender_user_id": m.group("sender"),
+                "raw_line": line,
             }
         )
 
     df = pd.DataFrame(rows)
-    if not df.empty:
-        df = df.sort_values("created_at_jst").reset_index(drop=True)
+    if df.empty:
+        return df
+
+    df = df.drop_duplicates(subset=["sender_user_id", "username", "timestamp_str"], keep="first")
+
+    df = df.sort_values(
+        by=["timestamp", "sender_user_id"],
+        ascending=[True, True],
+        na_position="last",
+        kind="stable",
+    ).reset_index(drop=True)
+
     return df
 
-def normalize_blacklist(df_bl: pd.DataFrame) -> pd.DataFrame:
-    # columns: sender_user_id / username のどちらでもOK
-    cols = {c.strip(): c for c in df_bl.columns}
-    sender_col = cols.get("sender_user_id")
-    user_col = cols.get("username")
-    if sender_col is None and user_col is None:
-        # 1列だけのCSVなども許容（最初の列をID扱い）
-        if len(df_bl.columns) >= 1:
-            sender_col = df_bl.columns[0]
 
-    out = pd.DataFrame()
-    if sender_col is not None:
-        out["sender_user_id"] = df_bl[sender_col].astype(str).str.strip()
-    else:
-        out["sender_user_id"] = ""
+# =========================
+# Blacklist (username, sender_user_id, reason)
+# internal: dict[sender_user_id] = {"username": str, "reason": str}
+# =========================
+def normalize_text(s: str) -> str:
+    return (s or "").strip()
 
-    if user_col is not None:
-        out["username"] = df_bl[user_col].astype(str).str.strip()
-    else:
-        out["username"] = ""
 
-    out = out.fillna("")
-    out = out[(out["sender_user_id"] != "") | (out["username"] != "")]
-    out = out.drop_duplicates().reset_index(drop=True)
-    return out
+def normalize_user_id(s: str) -> str:
+    return normalize_text(s)
 
-def apply_time_filter(df: pd.DataFrame, start_jst: datetime, end_jst: datetime) -> pd.DataFrame:
+
+def blacklist_to_df(blacklist: dict[str, dict[str, str]]) -> pd.DataFrame:
+    return pd.DataFrame(
+        [
+            {
+                "username": meta.get("username", ""),
+                "sender_user_id": uid,
+                "reason": meta.get("reason", ""),
+            }
+            for uid, meta in sorted(blacklist.items())
+        ]
+    )
+
+
+def load_blacklist_from_csv_bytes(content: bytes) -> dict[str, dict[str, str]]:
+    """
+    CSV想定:
+      username,sender_user_id,reason
+    - username/reason は任意（空OK）
+    - sender_user_id は必須
+    """
+    df = pd.read_csv(io.BytesIO(content))
     if df.empty:
-        return df
-    # Streamlitのdatetime_inputがnaiveを返す場合があるのでJSTを付与
-    if start_jst.tzinfo is None:
-        start_jst = start_jst.replace(tzinfo=JST)
-    if end_jst.tzinfo is None:
-        end_jst = end_jst.replace(tzinfo=JST)
+        return {}
 
-    mask = (df["created_at_jst"] >= start_jst) & (df["created_at_jst"] <= end_jst)
-    return df.loc[mask].reset_index(drop=True)
+    cols = {c.lower(): c for c in df.columns}
+    if "sender_user_id" not in cols:
+        raise ValueError("CSVに sender_user_id 列がありません（必須）")
 
-def apply_blacklist(df: pd.DataFrame, bl: pd.DataFrame) -> pd.DataFrame:
-    if df.empty or bl.empty:
-        return df
+    uid_col = cols["sender_user_id"]
+    name_col = cols.get("username")
+    reason_col = cols.get("reason")
 
-    # sender_user_id一致を優先で除外（usernameだけのBLも一応対応）
-    bl_ids = set(bl["sender_user_id"].astype(str).str.strip())
-    bl_names = set(bl["username"].astype(str).str.strip())
+    result: dict[str, dict[str, str]] = {}
+    for _, row in df.iterrows():
+        uid = normalize_user_id(str(row[uid_col]))
+        if not uid:
+            continue
 
-    def is_blocked(r):
-        sid = str(r["sender_user_id"]).strip()
-        un = str(r["username"]).strip()
-        return (sid in bl_ids and sid != "") or (un in bl_names and un != "")
+        username = normalize_text(str(row[name_col])) if name_col else ""
+        reason = normalize_text(str(row[reason_col])) if reason_col else ""
 
-    mask = ~df.apply(is_blocked, axis=1)
-    return df.loc[mask].reset_index(drop=True)
+        result[uid] = {"username": username, "reason": reason}
 
-def dedup_participants(df: pd.DataFrame) -> pd.DataFrame:
-    # 同一ユーザーが複数回出てきても「参加者」は1人扱いにする（必要なら後で切替）
-    if df.empty:
-        return df
-    return df.drop_duplicates(subset=["sender_user_id"], keep="first").reset_index(drop=True)
+    return result
 
-def draw_winners(df_participants: pd.DataFrame, k: int, seed: int | None) -> pd.DataFrame:
-    if df_participants.empty or k <= 0:
-        return df_participants.iloc[0:0].copy()
 
-    k = min(k, len(df_participants))
-    rng = random.Random(seed)  # Python標準random = メルセンヌ・ツイスタ
-    idx = list(df_participants.index)
-    winners_idx = rng.sample(idx, k=k)
-    winners = df_participants.loc[winners_idx].copy()
-    winners = winners.sort_values("created_at_jst").reset_index(drop=True)
-    return winners
+def merge_blacklist_auto_fill(
+    blacklist: dict[str, dict[str, str]],
+    participants: pd.DataFrame,
+) -> dict[str, dict[str, str]]:
+    """
+    ブラックリストの username が空のものを、participants から補完（見つかれば）
+    """
+    if participants is None or participants.empty:
+        return blacklist
 
+    # map sender_user_id -> username（participants優先で最初の非空）
+    uid_to_name: dict[str, str] = {}
+    for _, r in participants.iterrows():
+        uid = str(r.get("sender_user_id", "")).strip()
+        name = r.get("username", None)
+        if uid and uid not in uid_to_name:
+            uid_to_name[uid] = ("" if name is None else str(name).strip())
+
+    for uid, meta in blacklist.items():
+        if normalize_text(meta.get("username", "")) == "":
+            cand = uid_to_name.get(uid, "")
+            if cand:
+                meta["username"] = cand
+
+    return blacklist
+
+
+# =========================
+# Lottery
+# =========================
+@dataclass
+class LotteryResult:
+    winners: pd.DataFrame
+    pool: pd.DataFrame
+    excluded_blacklist: pd.DataFrame
+
+
+def run_lottery(
+    participants: pd.DataFrame,
+    blacklist: dict[str, dict[str, str]],
+    n_winners: int,
+    seed: Optional[int] = None,
+) -> LotteryResult:
+    """
+    participants: username, sender_user_id を含むDF
+    blacklist: dict[sender_user_id] = meta
+    """
+    if participants.empty:
+        return LotteryResult(
+            winners=pd.DataFrame(columns=participants.columns),
+            pool=participants,
+            excluded_blacklist=pd.DataFrame(columns=participants.columns),
+        )
+
+    bl_keys = set(blacklist.keys())
+
+    mask_bl = participants["sender_user_id"].astype(str).isin(bl_keys)
+    excluded = participants[mask_bl].copy()
+    pool = participants[~mask_bl].copy()
+
+    if pool.empty or n_winners <= 0:
+        return LotteryResult(
+            winners=pd.DataFrame(columns=participants.columns),
+            pool=pool,
+            excluded_blacklist=excluded,
+        )
+
+    pool_unique = pool.drop_duplicates(subset=["sender_user_id"], keep="first").reset_index(drop=True)
+
+    k = min(n_winners, len(pool_unique))
+    rng = random.Random(seed)
+    idxs = rng.sample(range(len(pool_unique)), k=k)
+    winners = pool_unique.iloc[idxs].copy().reset_index(drop=True)
+
+    return LotteryResult(winners=winners, pool=pool_unique, excluded_blacklist=excluded)
+
+
+# =========================
+# UI helpers
+# =========================
 def df_to_csv_bytes(df: pd.DataFrame) -> bytes:
-    buf = io.StringIO()
-    df.to_csv(buf, index=False)
-    return buf.getvalue().encode("utf-8")
+    return df.to_csv(index=False).encode("utf-8-sig")
 
-st.set_page_config(page_title="抽選機プロト", layout="wide")
-st.title("抽選機（Streamlitプロト）")
 
-with st.sidebar:
-    st.header("入力")
-    log_file = st.file_uploader("logファイル（.txt / .log）", type=["txt", "log"])
-    num_winners = st.number_input("抽選人数", min_value=1, max_value=1000, value=3, step=1)
+def suggest_default_time_range(df: pd.DataFrame) -> tuple[Optional[datetime], Optional[datetime]]:
+    if df.empty or "timestamp" not in df.columns:
+        return None, None
+    ts = df["timestamp"].dropna()
+    if ts.empty:
+        return None, None
+    return ts.min().to_pydatetime(), ts.max().to_pydatetime()
 
-    st.caption("時間はJSTで指定。log内の created at (UTC) をJSTに変換して判定します。")
-    now_jst = datetime.now(JST)
-    default_start = (now_jst.replace(hour=0, minute=0, second=0, microsecond=0))
-    default_end = now_jst
 
-    start_time = st.datetime_input("開始時間（JST）", value=default_start)
-    end_time = st.datetime_input("終了時間（JST）", value=default_end)
+# =========================
+# Streamlit App
+# =========================
+def main() -> None:
+    st.set_page_config(page_title="RequestInviteLottery", layout="wide")
+    st.title("RequestInviteLottery")
+    st.caption(
+        "ログをドラッグ&ドロップ → requestInvite だけ抽出 → 指定時間で絞って抽選。"
+        "ブラックリストは username / sender_user_id / reason のCSV入出力対応。"
+    )
 
-    st.divider()
-    st.subheader("ブラックリスト")
-    bl_file = st.file_uploader("ブラックリストCSV（任意）", type=["csv"], key="bl_csv")
-    seed_text = st.text_input("抽選シード（空ならランダム）", value="")
+    # ---- session state ----
+    if "blacklist" not in st.session_state:
+        st.session_state.blacklist = {}  # dict[sender_user_id] = {"username":..., "reason":...}
+    if "winners_df" not in st.session_state:
+        st.session_state.winners_df = pd.DataFrame()
+    if "participants_df" not in st.session_state:
+        st.session_state.participants_df = pd.DataFrame()
 
-    run = st.button("抽選開始", type="primary")
+    # =========================
+    # Sidebar: Settings
+    # =========================
+    with st.sidebar:
+        st.header("抽選設定")
 
-# ブラックリスト読み込み
-blacklist_df = pd.DataFrame(columns=["sender_user_id", "username"])
-if bl_file is not None:
-    try:
-        tmp = pd.read_csv(bl_file)
-        blacklist_df = normalize_blacklist(tmp)
-    except Exception as e:
-        st.error(f"ブラックリストCSVの読み込みに失敗: {e}")
+        n_winners = st.number_input("抽選人数", min_value=0, max_value=10000, value=1, step=1)
 
-# メイン処理
-if run:
-    if log_file is None:
-        st.error("logファイルをアップロードしてください。")
-        st.stop()
+        use_seed = st.checkbox("シード固定（再現性が必要な場合ON）", value=False)
+        seed = None
+        if use_seed:
+            seed = st.number_input("seed", min_value=0, max_value=2_147_483_647, value=42, step=1)
 
-    raw = log_file.read().decode("utf-8", errors="replace")
-    df_all = parse_log_to_df(raw)
+        st.divider()
+        st.subheader("ブラックリスト（username / user_id / reason）")
 
-    col1, col2, col3 = st.columns(3)
-    col1.metric("抽出件数（requestInvite）", int(len(df_all)))
-    col2.metric("ブラックリスト件数", int(len(blacklist_df)))
-    col3.metric("抽選人数", int(num_winners))
+        # 手動追加
+        add_name = st.text_input("ユーザー名（任意）", value="", key="bl_add_name")
+        add_uid = st.text_input("ユーザーID（必須）（usr_...）", value="", key="bl_add_uid")
+        add_reason = st.text_input("理由（任意）", value="", key="bl_add_reason")
 
-    if df_all.empty:
-        st.warning("requestInvite に該当する行が見つかりませんでした。")
-        st.stop()
+        col_a, col_b = st.columns(2)
+        with col_a:
+            if st.button("追加", use_container_width=True):
+                uid = normalize_user_id(add_uid)
+                if uid:
+                    st.session_state.blacklist[uid] = {
+                        "username": normalize_text(add_name),
+                        "reason": normalize_text(add_reason),
+                    }
+        with col_b:
+            if st.button("全クリア", use_container_width=True):
+                st.session_state.blacklist = {}
 
-    df_time = apply_time_filter(df_all, start_time, end_time)
-    df_clean = apply_blacklist(df_time, blacklist_df)
-    df_participants = dedup_participants(df_clean)
+        # インポート
+        bl_up = st.file_uploader("ブラックリストCSVをインポート", type=["csv"], key="bl_uploader")
+        if bl_up is not None:
+            try:
+                imported = load_blacklist_from_csv_bytes(bl_up.getvalue())
+                st.session_state.blacklist.update(imported)
+                st.success(f"インポート: {len(imported)} 件")
+            except Exception as e:
+                st.error(f"ブラックリストCSVの読み取りに失敗: {e}")
 
-    st.subheader("参加者（時間内・BL除外・重複除去後）")
-    st.dataframe(df_participants, use_container_width=True, height=260)
+        # ブラックリスト表示＆エクスポート
+        bl_df = blacklist_to_df(st.session_state.blacklist)
+        st.write(f"現在のブラックリスト: {len(st.session_state.blacklist)} 件")
+        st.dataframe(bl_df, use_container_width=True, height=220)
 
-    # seed
-    seed = None
-    if seed_text.strip() != "":
-        try:
-            seed = int(seed_text.strip())
-        except ValueError:
-            # 文字列でもOKにする（安定再現用）
-            seed = abs(hash(seed_text.strip())) % (2**32)
-
-    winners_df = draw_winners(df_participants, int(num_winners), seed)
-
-    st.subheader("当選者")
-    if winners_df.empty:
-        st.warning("当選者が作れませんでした（参加者ゼロ or 抽選人数0）。")
-    else:
-        st.dataframe(winners_df[["username", "sender_user_id", "created_at_jst"]], use_container_width=True, height=240)
-
-    # エクスポート
-    st.divider()
-    st.subheader("エクスポート / インポート")
-
-    c1, c2, c3 = st.columns(3)
-
-    with c1:
         st.download_button(
-            "当選者リストCSVをダウンロード",
-            data=df_to_csv_bytes(winners_df[["username", "sender_user_id", "created_at_jst"]]),
+            "ブラックリストCSVをエクスポート",
+            data=df_to_csv_bytes(bl_df),
+            file_name="blacklist.csv",
+            mime="text/csv",
+            use_container_width=True,
+        )
+
+        with st.expander("ブラックリストCSVフォーマット例"):
+            st.code(
+                "username,sender_user_id,reason\n"
+                "Alice,usr_aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee,迷惑行為\n"
+                "Bob,usr_ffffffff-1111-2222-3333-444444444444,視界ジャック\n"
+            )
+
+    # =========================
+    # Main: Upload log & parse
+    # =========================
+    st.subheader("1) ログ投入（ドラッグ&ドロップ）")
+    up = st.file_uploader("VRChat log (.txt / .log)", type=["txt", "log"], key="log_uploader")
+
+    if up is None:
+        st.info("ログファイルをアップロードしてください。")
+        return
+
+    raw = up.getvalue().decode("utf-8", errors="replace")
+    lines = raw.splitlines()
+    parsed_df = parse_request_invite_lines(lines)
+
+    if parsed_df.empty:
+        st.warning("type:requestInvite が見つかりませんでした。")
+        with st.expander("デバッグ: Received Notification を含む行（先頭200行中）"):
+            sample = [l for l in lines[:200] if "Received Notification" in l]
+            st.text("\n".join(sample[:50]) if sample else "該当行なし")
+        return
+
+    st.success(f"requestInvite 抽出: {len(parsed_df)} 行")
+
+    # =========================
+    # 2) Time filter
+    # =========================
+    st.subheader("2) 指定時間で絞り込み")
+
+    min_ts, max_ts = suggest_default_time_range(parsed_df)
+
+    col1, col2 = st.columns(2)
+    with col1:
+        start_dt = st.date_input(
+            "開始日",
+            value=min_ts.date() if min_ts else datetime.now().date(),
+        )
+        start_tm = st.time_input(
+            "開始時刻",
+            value=min_ts.time() if min_ts else datetime.now().time().replace(second=0, microsecond=0),
+        )
+    with col2:
+        end_dt = st.date_input(
+            "終了日",
+            value=max_ts.date() if max_ts else datetime.now().date(),
+        )
+        end_tm = st.time_input(
+            "終了時刻",
+            value=max_ts.time() if max_ts else datetime.now().time().replace(second=0, microsecond=0),
+        )
+
+    start = datetime.combine(start_dt, start_tm)
+    end = datetime.combine(end_dt, end_tm)
+
+    time_mask = parsed_df["timestamp"].notna() & (parsed_df["timestamp"] >= start) & (parsed_df["timestamp"] <= end)
+    filtered_df = parsed_df[time_mask].copy().reset_index(drop=True)
+
+    st.write(f"時間内 requestInvite: **{len(filtered_df)} 行**（{start} 〜 {end}）")
+
+    participants = (
+        filtered_df[["username", "sender_user_id", "timestamp_str", "timestamp"]]
+        .drop_duplicates(subset=["sender_user_id"], keep="first")
+        .sort_values(["timestamp", "sender_user_id"], kind="stable")
+        .reset_index(drop=True)
+    )
+
+    st.session_state.participants_df = participants
+
+    # blacklist の username を participants から補完（空欄のみ）
+    st.session_state.blacklist = merge_blacklist_auto_fill(st.session_state.blacklist, participants)
+
+    with st.expander("抽出データ（requestInvite行）"):
+        st.dataframe(filtered_df[["timestamp_str", "username", "sender_user_id"]], use_container_width=True)
+
+    st.subheader("リクインリスト")
+    st.write(f"参加者: **{len(participants)} 人**")
+    st.dataframe(participants[["timestamp_str", "username", "sender_user_id"]], use_container_width=True)
+
+    st.download_button(
+        "リクインリストCSVをエクスポート",
+        data=df_to_csv_bytes(participants[["timestamp_str", "username", "sender_user_id"]]),
+        file_name="participants.csv",
+        mime="text/csv",
+    )
+
+    # =========================
+    # 3) Lottery
+    # =========================
+    st.subheader("3) 抽選")
+
+    col_run, col_info = st.columns([1, 2])
+    with col_run:
+        if st.button("抽選開始", type="primary", use_container_width=True):
+            result = run_lottery(
+                participants=participants[["username", "sender_user_id"]].copy(),
+                blacklist=st.session_state.blacklist,
+                n_winners=int(n_winners),
+                seed=int(seed) if use_seed else None,
+            )
+            st.session_state.winners_df = result.winners
+            st.session_state._last_pool_df = result.pool
+            st.session_state._last_excluded_bl_df = result.excluded_blacklist
+
+    with col_info:
+        st.write(
+            f"- 抽選人数: **{int(n_winners)}**\n"
+            f"- シード: **{seed if use_seed else '未使用'}**\n"
+            f"- ブラックリスト: **{len(st.session_state.blacklist)} 件**"
+        )
+
+    winners_df = st.session_state.winners_df
+    if winners_df is not None and not winners_df.empty:
+        st.success(f"当選者: **{len(winners_df)} 人**")
+        st.dataframe(winners_df, use_container_width=True)
+
+        st.download_button(
+            "当選者CSVをエクスポート",
+            data=df_to_csv_bytes(winners_df),
             file_name="winners.csv",
             mime="text/csv",
         )
 
-    with c2:
-        st.download_button(
-            "参加者リストCSVをダウンロード",
-            data=df_to_csv_bytes(df_participants[["username", "sender_user_id", "created_at_jst"]]),
-            file_name="participants.csv",
-            mime="text/csv",
-        )
+        with st.expander("抽選詳細"):
+            pool_df = getattr(st.session_state, "_last_pool_df", pd.DataFrame())
+            excl_df = getattr(st.session_state, "_last_excluded_bl_df", pd.DataFrame())
 
-    with c3:
-        st.download_button(
-            "ブラックリストCSVをダウンロード",
-            data=df_to_csv_bytes(blacklist_df),
-            file_name="blacklist.csv",
-            mime="text/csv",
-        )
+            st.write(f"抽選母集団: {len(pool_df)} 人")
+            st.dataframe(pool_df, use_container_width=True)
 
-else:
-    st.info("左のサイドバーで log と条件を入力して「抽選開始」を押してください。")
-    st.caption("パース対象は type:requestInvite を含む通知行です。created at: ... UTC をJSTへ変換します。")
+            st.write(f"ブラックリストにより除外: {len(excl_df)} 人")
+            st.dataframe(excl_df, use_container_width=True)
+
+            # 除外者に reason を付けた表
+            if not excl_df.empty:
+                reason_rows = []
+                for _, r in excl_df.iterrows():
+                    uid = str(r["sender_user_id"])
+                    meta = st.session_state.blacklist.get(uid, {})
+                    reason_rows.append(
+                        {
+                            "username": r.get("username", ""),
+                            "sender_user_id": uid,
+                            "reason": meta.get("reason", ""),
+                        }
+                    )
+                st.write("除外者（理由付き）")
+                st.dataframe(pd.DataFrame(reason_rows), use_container_width=True)
+
+    else:
+        st.info("「抽選開始」を押すと当選者が表示されます。")
+
+
+if __name__ == "__main__":
+    main()
